@@ -1,6 +1,5 @@
 #!/usr/bin/env bats
-# TDD 测试: toggle-openclaw.sh
-# 通过 mock 系统命令测试脚本行为
+# TDD 测试: toggle-openclaw.sh (支持 Gateway + Node Host)
 
 setup() {
   export TEST_TMPDIR=$(mktemp -d)
@@ -19,19 +18,25 @@ exit 0
 MOCK
   chmod +x "$MOCK_BINDIR/launchctl"
 
-  # Mock lsof - simulate port in use
+  # Mock lsof
   cat > "$MOCK_BINDIR/lsof" <<'MOCK'
 #!/bin/bash
-# lsof -ti :PORT  (used in disable_service)
 if [ "$1" = "-ti" ]; then
   echo "12345"
   exit 0
 fi
-# lsof -i :PORT -P -n (used in get_service_status)
 echo "node 12345 thomas 15u IPv4 0xabc 0t0 TCP 127.0.0.1 (LISTEN)"
 exit 0
 MOCK
   chmod +x "$MOCK_BINDIR/lsof"
+
+  # Mock pgrep
+  cat > "$MOCK_BINDIR/pgrep" <<'MOCK'
+#!/bin/bash
+echo "54321"
+exit 0
+MOCK
+  chmod +x "$MOCK_BINDIR/pgrep"
 
   export ORIGINAL_PATH="$PATH"
   export PATH="$MOCK_BINDIR:$PATH"
@@ -47,11 +52,12 @@ teardown() {
 # status 命令
 # ============================================================
 
-@test "status: 服务运行时显示服务名称和端口" {
+@test "status: 服务运行时显示所有服务名称" {
   run "$SCRIPT" status
   [ "$status" -eq 0 ]
   echo "$output" | grep -q "Main Gateway"
   echo "$output" | grep -q "Rescue Gateway"
+  echo "$output" | grep -q "Node Host"
 }
 
 @test "status: 不输出错误信息" {
@@ -60,12 +66,14 @@ teardown() {
 }
 
 @test "status: 进程不在运行时显示已停止" {
-  # lsof returns nothing
   cat > "$MOCK_BINDIR/lsof" <<'MOCK'
 #!/bin/bash
 exit 1
 MOCK
-  # launchctl says not running
+  cat > "$MOCK_BINDIR/pgrep" <<'MOCK'
+#!/bin/bash
+exit 1
+MOCK
   cat > "$MOCK_BINDIR/launchctl" <<'MOCK'
 #!/bin/bash
 echo "launchctl $@" >> "$TEST_TMPDIR/launchctl.log"
@@ -79,7 +87,7 @@ MOCK
 }
 
 # ============================================================
-# on 命令 - 开启服务
+# on 命令
 # ============================================================
 
 @test "on: 退出码为 0" {
@@ -93,8 +101,15 @@ MOCK
   grep -q "bootstrap" "$TEST_TMPDIR/launchctl.log"
 }
 
+@test "on: 三个服务都调用 enable" {
+  run "$SCRIPT" on
+  local count
+  count=$(grep -c "enable" "$TEST_TMPDIR/launchctl.log" || true)
+  [ "$count" -ge 3 ]
+}
+
 # ============================================================
-# off 命令 - 关闭服务
+# off 命令
 # ============================================================
 
 @test "off: 退出码为 0" {
@@ -103,20 +118,16 @@ MOCK
 }
 
 @test "off: 调用 launchctl bootout 和 disable" {
-  # Use stateful mock: after first lsof call, kill silently fails (bash builtin)
-  # lsof always returns PID since kill is builtin, so script outputs warning
   run "$SCRIPT" off
-  # Verify launchctl was called correctly
   grep -q "bootout" "$TEST_TMPDIR/launchctl.log"
   grep -q "disable" "$TEST_TMPDIR/launchctl.log"
 }
 
-@test "off: 对两个 gateway 都执行 bootout" {
+@test "off: 三个服务都执行 bootout" {
   run "$SCRIPT" off
-  # Count bootout lines
   local count
   count=$(grep -c "bootout" "$TEST_TMPDIR/launchctl.log" || true)
-  [ "$count" -ge 2 ]
+  [ "$count" -ge 3 ]
 }
 
 # ============================================================

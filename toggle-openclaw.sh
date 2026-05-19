@@ -1,40 +1,33 @@
 #!/bin/bash
-# toggle-openclaw.sh - 切换 OpenClaw Gateway 开机启动/后台运行
-# 使用方式: 直接运行，在菜单中选择功能
+# toggle-openclaw.sh - 切换 OpenClaw 服务开机启动/后台运行
+# 支持: Main Gateway, Rescue Gateway, Node Host
 
 set -euo pipefail
 
 HOME_DIR="$HOME"
-MAIN_PLIST_LABEL="ai.openclaw.gateway"
-MAIN_PLIST_FILE="$HOME_DIR/Library/LaunchAgents/$MAIN_PLIST_LABEL.plist"
-MAIN_PORT="18789"
-
-RESCUE_PLIST_LABEL="ai.openclaw.rescue-gateway"
-RESCUE_PLIST_FILE="$HOME_DIR/Library/LaunchAgents/$RESCUE_PLIST_LABEL.plist"
-RESCUE_PORT="19001"
-
 GUI_UID="gui/$(id -u)"
+
+# 服务定义: 显示名称|plist 标签|端口(可为空)|进程名(用于 kill)
+SERVICES=(
+  "Main Gateway|ai.openclaw.gateway|18789|openclaw-gateway"
+  "Rescue Gateway|ai.openclaw.rescue-gateway|19001|openclaw-gateway"
+  "Node Host|ai.openclaw.node||openclaw-node"
+)
 
 # ============================================================
 # 工具函数
 # ============================================================
 
 get_service_status() {
-  local label="$1"
-  local port="$2"
-  local name="$3"
+  local label="$1" port="$2" name="$3" proc_name="$4"
 
-  # 检查 launchd 状态
   local launchd_info
   launchd_info=$(launchctl print "$GUI_UID/$label" 2>/dev/null || true)
 
-  local loaded=false
-  local running=false
-  local disabled=false
+  local loaded=false running=false disabled=false
 
   if echo "$launchd_info" | grep -q "state = running"; then
-    loaded=true
-    running=true
+    loaded=true; running=true
   elif echo "$launchd_info" | grep -q "state = waiting"; then
     loaded=true
   fi
@@ -43,21 +36,31 @@ get_service_status() {
     disabled=true
   fi
 
-  # 额外检查进程是否在监听端口
+  # 额外检查端口监听或进程存在
   local port_active=false
-  if lsof -i :"$port" -P -n 2>/dev/null | grep -q LISTEN; then
-    port_active=true
+  if [ -n "$port" ]; then
+    if lsof -i :"$port" -P -n 2>/dev/null | grep -q LISTEN; then
+      port_active=true
+    fi
+  fi
+  local proc_active=false
+  if [ -n "$proc_name" ]; then
+    if pgrep -x "$proc_name" >/dev/null 2>&1; then
+      proc_active=true
+    fi
   fi
 
-  # 输出状态
+  local suffix=""
+  [ -n "$port" ] && suffix=" (端口 $port)"
+
   if $running; then
-    echo "[运行中] $name (端口 $port)"
+    echo "[运行中] $name$suffix"
   elif $loaded; then
-    echo "[已加载但未运行] $name (端口 $port) - KeepAlive 等待中"
-  elif $port_active; then
-    echo "[端口活跃但未受 launchd 管理] $name (端口 $port)"
+    echo "[已加载但未运行] $name$suffix - KeepAlive 等待中"
+  elif $port_active || $proc_active; then
+    echo "[进程活跃但未受 launchd 管理] $name$suffix"
   else
-    echo "[已停止] $name (端口 $port)"
+    echo "[已停止] $name$suffix"
   fi
 
   if $disabled; then
@@ -66,20 +69,13 @@ get_service_status() {
 }
 
 enable_service() {
-  local label="$1"
-  local plist_file="$2"
-  local port="$3"
-  local name="$4"
+  local label="$1" plist_file="$2" port="$3" name="$4" proc_name="$5"
 
   echo "▶ 开启 $name..."
-
-  # 启用（解除 disable 状态）
   launchctl enable "$GUI_UID/$label" 2>/dev/null || true
 
-  # 加载 plist
   if [ -f "$plist_file" ]; then
     launchctl bootstrap "$GUI_UID" "$plist_file" 2>/dev/null || {
-      # 可能已经 bootstrap 过，先 bootout 再重试
       launchctl bootout "$GUI_UID" "$plist_file" 2>/dev/null || true
       launchctl bootstrap "$GUI_UID" "$plist_file" 2>/dev/null || true
     }
@@ -91,41 +87,63 @@ enable_service() {
 }
 
 disable_service() {
-  local label="$1"
-  local plist_file="$2"
-  local port="$3"
-  local name="$4"
+  local label="$1" plist_file="$2" port="$3" name="$4" proc_name="$5"
 
   echo "⏹ 关闭 $name..."
 
-  # 卸载 launchd 任务（停止进程 + 取消 launchd 管理）
+  # 卸载 launchd 任务
   if [ -f "$plist_file" ]; then
     launchctl bootout "$GUI_UID" "$plist_file" 2>/dev/null || true
   fi
-
-  # 禁用（阻止下次登录时自动加载）
   launchctl disable "$GUI_UID/$label" 2>/dev/null || true
 
-  # 杀死仍在该端口监听的进程（可能由其他方式启动）
-  local pids
-  pids=$(lsof -ti :"$port" 2>/dev/null || true)
-  if [ -n "$pids" ]; then
-    kill "$pids" 2>/dev/null || true
-    sleep 1
-    # 强制杀
-    local remaining
-    remaining=$(lsof -ti :"$port" 2>/dev/null || true)
-    if [ -n "$remaining" ]; then
-      kill -9 "$remaining" 2>/dev/null || true
+  # Kill 进程 — 优先按端口，否则按进程名
+  local killed=false
+  if [ -n "$port" ]; then
+    local pids
+    pids=$(lsof -ti :"$port" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      kill "$pids" 2>/dev/null || true
+      sleep 1
+      local remaining
+      remaining=$(lsof -ti :"$port" 2>/dev/null || true)
+      if [ -n "$remaining" ]; then
+        kill -9 "$remaining" 2>/dev/null || true
+      fi
+      killed=true
+    fi
+  fi
+  if [ -n "$proc_name" ]; then
+    local pids
+    pids=$(pgrep -x "$proc_name" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      kill "$pids" 2>/dev/null || true
+      sleep 1
+      local remaining
+      remaining=$(pgrep -x "$proc_name" 2>/dev/null || true)
+      if [ -n "$remaining" ]; then
+        kill -9 "$remaining" 2>/dev/null || true
+      fi
+      killed=true
     fi
   fi
 
   # 验证
   sleep 0.5
-  if lsof -i :"$port" -P -n 2>/dev/null | grep -q LISTEN; then
-    echo "  ⚠ $name (端口 $port) 仍在运行，可能需要手动处理"
+  local still_alive=false
+  if [ -n "$port" ] && lsof -i :"$port" -P -n 2>/dev/null | grep -q LISTEN; then
+    still_alive=true
+  fi
+  if [ -n "$proc_name" ] && pgrep -x "$proc_name" >/dev/null 2>&1; then
+    still_alive=true
+  fi
+
+  if $still_alive; then
+    echo "  ⚠ $name 仍在运行，可能需要手动处理"
   else
-    echo "  ✓ $name 已停止，开机启动已取消"
+    local suffix=""
+    [ -n "$port" ] && suffix=" (端口 $port)"
+    echo "  ✓ $name$suffix 已停止，开机启动已取消"
   fi
 }
 
@@ -136,119 +154,133 @@ disable_service() {
 show_menu() {
   echo ""
   echo "=========================================="
-  echo "  OpenClaw Gateway 服务切换工具"
+  echo "  OpenClaw 服务切换工具"
   echo "=========================================="
   echo ""
   echo "  当前状态:"
   echo "  ────────────────────────────────────────"
-  get_service_status "$MAIN_PLIST_LABEL" "$MAIN_PORT" "Main Gateway"
-  echo ""
-  get_service_status "$RESCUE_PLIST_LABEL" "$RESCUE_PORT" "Rescue Gateway"
+  for i in "${!SERVICES[@]}"; do
+    IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+    get_service_status "$label" "$port" "$name" "$proc"
+    echo ""
+  done
   echo "  ────────────────────────────────────────"
   echo ""
   echo "  请选择操作:"
   echo ""
-  echo "    1) 开启全部 (开机启动 + 启动服务)"
-  echo "    2) 关闭全部 (取消开机启动 + 停止服务)"
-  echo "    3) 仅开启 Main Gateway (18789)"
-  echo "    4) 仅关闭 Main Gateway (18789)"
-  echo "    5) 仅开启 Rescue Gateway (19001)"
-  echo "    6) 仅关闭 Rescue Gateway (19001)"
-  echo "    7) 刷新状态"
-  echo "    8) 退出"
-  echo ""
-  read -r -p "  请输入选项 (1-8): " choice
+  echo "    1) 开启全部"
+  echo "    2) 关闭全部"
+  local refresh_idx=$(( ${#SERVICES[@]} * 2 + 3 ))
+  local exit_idx=$(( refresh_idx + 1 ))
 
-  case "$choice" in
-    1)
+  for i in "${!SERVICES[@]}"; do
+    IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+    local suffix=""
+    [ -n "$port" ] && suffix=" ($port)"
+    local enable_idx=$((i * 2 + 3))
+    local disable_idx=$((i * 2 + 4))
+    echo "    $enable_idx) 仅开启 $name$suffix"
+    echo "    $disable_idx) 仅关闭 $name$suffix"
+  done
+  echo "    $refresh_idx) 刷新状态"
+  echo "    $exit_idx) 退出"
+  echo ""
+  read -r -p "  请输入选项 (1-$exit_idx): " choice
+
+  # 开启全部
+  if [ "$choice" = "1" ]; then
+    echo ""
+    for i in "${!SERVICES[@]}"; do
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      enable_service "$label" "$plist_file" "$port" "$name" "$proc"
       echo ""
-      enable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
+    done
+    echo "所有服务已开启 ✓"
+    read -r -p "按回车返回菜单..."
+    show_menu
+    return
+  fi
+
+  # 关闭全部
+  if [ "$choice" = "2" ]; then
+    echo ""
+    for i in "${!SERVICES[@]}"; do
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      disable_service "$label" "$plist_file" "$port" "$name" "$proc"
       echo ""
-      enable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-      echo ""
-      echo "所有服务已开启 ✓"
+    done
+    echo "所有服务已关闭 ✓"
+    read -r -p "按回车返回菜单..."
+    show_menu
+    return
+  fi
+
+  # 单个服务操作
+  for i in "${!SERVICES[@]}"; do
+    local enable_idx=$((i * 2 + 3))
+    local disable_idx=$((i * 2 + 4))
+    if [ "$choice" = "$enable_idx" ]; then
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      enable_service "$label" "$plist_file" "$port" "$name" "$proc"
       echo ""
       read -r -p "按回车返回菜单..."
       show_menu
-      ;;
-    2)
-      echo ""
-      disable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
-      echo ""
-      disable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-      echo ""
-      echo "所有服务已关闭 ✓"
+      return
+    elif [ "$choice" = "$disable_idx" ]; then
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      disable_service "$label" "$plist_file" "$port" "$name" "$proc"
       echo ""
       read -r -p "按回车返回菜单..."
       show_menu
-      ;;
-    3)
-      echo ""
-      enable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
-      echo ""
-      read -r -p "按回车返回菜单..."
-      show_menu
-      ;;
-    4)
-      echo ""
-      disable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
-      echo ""
-      read -r -p "按回车返回菜单..."
-      show_menu
-      ;;
-    5)
-      echo ""
-      enable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-      echo ""
-      read -r -p "按回车返回菜单..."
-      show_menu
-      ;;
-    6)
-      echo ""
-      disable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-      echo ""
-      read -r -p "按回车返回菜单..."
-      show_menu
-      ;;
-    7)
-      show_menu
-      ;;
-    8)
-      echo ""
-      echo "退出."
-      exit 0
-      ;;
-    *)
-      echo ""
-      echo "无效选项，请重新选择"
-      sleep 1
-      show_menu
-      ;;
-  esac
+      return
+    fi
+  done
+
+  # 刷新或退出
+  if [ "$choice" = "$refresh_idx" ]; then
+    show_menu
+  elif [ "$choice" = "$exit_idx" ]; then
+    echo ""; echo "退出."; exit 0
+  else
+    echo ""; echo "无效选项，请重新选择"; sleep 1
+    show_menu
+  fi
 }
 
 # ============================================================
-# 入口 - 也支持命令行参数
+# 入口
 # ============================================================
 
 case "${1:-}" in
   on|enable|start)
-    enable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
-    enable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-    echo ""
+    for i in "${!SERVICES[@]}"; do
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      enable_service "$label" "$plist_file" "$port" "$name" "$proc"
+      echo ""
+    done
     echo "所有服务已开启 ✓"
     exit 0
     ;;
   off|disable|stop)
-    disable_service "$MAIN_PLIST_LABEL" "$MAIN_PLIST_FILE" "$MAIN_PORT" "Main Gateway"
-    disable_service "$RESCUE_PLIST_LABEL" "$RESCUE_PLIST_FILE" "$RESCUE_PORT" "Rescue Gateway"
-    echo ""
+    for i in "${!SERVICES[@]}"; do
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      plist_file="$HOME_DIR/Library/LaunchAgents/$label.plist"
+      disable_service "$label" "$plist_file" "$port" "$name" "$proc"
+      echo ""
+    done
     echo "所有服务已关闭 ✓"
     exit 0
     ;;
   status)
-    get_service_status "$MAIN_PLIST_LABEL" "$MAIN_PORT" "Main Gateway"
-    get_service_status "$RESCUE_PLIST_LABEL" "$RESCUE_PORT" "Rescue Gateway"
+    for i in "${!SERVICES[@]}"; do
+      IFS='|' read -r name label port proc <<< "${SERVICES[$i]}"
+      get_service_status "$label" "$port" "$name" "$proc"
+    done
     exit 0
     ;;
   ""|menu)
