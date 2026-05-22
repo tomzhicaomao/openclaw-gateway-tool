@@ -103,7 +103,58 @@ npm install -g bats
 bats ~/bin/test-toggle-openclaw.bats
 ```
 
+---
+
+## 配套工具：模型配置切换
+
+`configure-openclaw-model.sh` 用于快速切换 OpenClaw 的大模型配置（如切换到 DeepSeek）：
+
+### 安装
+
+```bash
+curl -o ~/bin/configure-openclaw-model.sh https://raw.githubusercontent.com/tomzhicaomao/openclaw-gateway-tool/main/configure-openclaw-model.sh
+chmod +x ~/bin/configure-openclaw-model.sh
+```
+
+### 交互式使用
+
+```bash
+configure-openclaw-model.sh
+```
+
+按提示输入 API Key 即可完成配置。
+
+### 命令行使用
+
+```bash
+# 所有 agent 使用同一模型
+configure-openclaw-model.sh \
+  --api-key sk-xxx \
+  --model deepseek-v4-flash
+
+# 区分主 agent 和普通 agent
+configure-openclaw-model.sh \
+  --api-key sk-xxx \
+  --lead-model deepseek-v4-pro \
+  --model deepseek-v4-flash \
+  --lead-agent pm01
+
+# 跳过确认，直接执行
+configure-openclaw-model.sh --api-key sk-xxx --model deepseek-v4-flash --force
+```
+
+### 工作原理
+
+脚本通过 Python3 直接编辑 `~/.openclaw/openclaw.json` 和 `~/.openclaw-rescue/openclaw.json`：
+
+1. 备份原配置文件
+2. 添加新的模型 Provider（如 DeepSeek）
+3. 更新默认模型和每个 Agent 的模型分配
+4. 验证 JSON 合法性
+5. 保留原有 Provider 作为 fallback
+
 ## 文件
 
-- `toggle-openclaw.sh` — 主脚本（数组驱动的服务定义，易扩展）
+- `toggle-openclaw.sh` — 服务切换主脚本（数组驱动的服务定义，易扩展）
+- `configure-openclaw-model.sh` — 大模型配置切换脚本
 - `test-toggle-openclaw.bats` — Bats 单元测试（11 个测试用例）
